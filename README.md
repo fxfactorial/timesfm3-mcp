@@ -103,6 +103,88 @@ Optional calendar (does not change the model output, only labels it):
 
 `freq` is `H`, `D`, `W`, or `M`. `start` is the first history timestamp. If you pass a `timestamps` list instead, it must be length `T` and strictly regular — gaps are an error, not filled. Omit all of these and the response stays array-only.
 
+### Batched forecasts and quantile widths
+
+`forecast_batch(windows, horizon, window_ids, asof_timestamps)` decodes N
+independent univariate contexts in **one** model pass — equivalent to N
+separate `forecast(history=...)` calls, but a single batched `predict_batch`.
+All windows must share the same context length `T`. This collapses backfill
+and study loops (thousands of sequential calls) into a handful of batched
+requests. Each window's result carries its own `forecast` and nine
+`quantiles` curves; `window_ids` names them, and `asof_timestamps` (length N,
+strictly regular ISO dates, one per window — the bar each window forecasts
+from) echoes each window's as-of timestamp and its full forecast-step grid,
+so consumers never pin results by position alone:
+
+```json
+{
+  "windows": [[...512 values...], [...512 values...]],
+  "horizon": 96,
+  "window_ids": ["eth", "btc"],
+  "asof_timestamps": ["2026-09-01T00:00", "2026-09-01T00:15"]
+}
+```
+
+```json
+{
+  "status": "success",
+  "mode": "batch",
+  "n_windows": 2,
+  "context_length": 512,
+  "horizon": 96,
+  "windows": [
+    {
+      "id": "eth",
+      "asof": "2026-09-01T00:00",
+      "timestamps": ["2026-09-01T00:15", "..."],
+      "forecast": ["..."],
+      "quantiles": {"q10": ["..."], "...": "...", "q90": ["..."]}
+    },
+    {"id": "btc", "asof": "2026-09-01T00:15", "...": "..."}
+  ],
+  "quantile_levels": [0.1, "...", 0.9],
+  "license": "..."
+}
+```
+
+`widths(windows, horizon, lower, upper, with_median, asof_timestamps)` is the
+compact volatility-band variant: for each window it returns
+`width = q(upper) - q(lower)` and (optionally) the median at the **final**
+forward step only, plus flat `widths` / `medians` arrays. The range is
+base-invariant (a shared level offset cancels), so it can be computed directly
+without a reference price. `lower` / `upper` must be quantile levels the model
+returns (0.10–0.90, default 0.10 / 0.90). Consumers that only need a
+forward vol band — e.g. an entry gate or a study label — get one small number
+per window instead of nine full quantile curves:
+
+```json
+{
+  "windows": [[...512 values...]],
+  "horizon": 96,
+  "lower": 0.10,
+  "upper": 0.90,
+  "asof_timestamps": ["2026-09-01T00:00"]
+}
+```
+
+```json
+{
+  "status": "success",
+  "mode": "widths",
+  "n_windows": 1,
+  "horizon": 96,
+  "lower": 0.1,
+  "upper": 0.9,
+  "windows": [{"id": "window_0", "asof": "2026-09-01T00:00", "width": 0.0512, "median": 7.6041}],
+  "widths": [0.0512],
+  "medians": [7.6041]
+}
+```
+
+Both tools reject a batch if any window is malformed (empty, non-finite, or a
+different length than the others) *before* the model runs, so a single bad
+context fails fast with a precise error rather than a silent mis-shaped decode.
+
 ## Local setup
 
 Weights are gated on Hugging Face. Accept the model terms, then log in.

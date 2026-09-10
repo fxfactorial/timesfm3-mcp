@@ -244,6 +244,256 @@ def _calendar_from_timestamps(
     return payload
 
 
+def _quantile_index(level: float) -> int:
+    for i, lv in enumerate(QUANTILE_LEVELS):
+        if abs(lv - float(level)) < 1e-9:
+            return i
+    raise ValueError(f"level {level} is not one of the quantile levels {QUANTILE_LEVELS}")
+
+
+def resolve_windows(windows: list[list[float]] | None) -> list[np.ndarray]:
+    """Validate N univariate contexts of a single shared length T."""
+    if windows is None or not windows:
+        raise ValueError("windows must be a non-empty list of contexts")
+    rows: list[np.ndarray] = []
+    for i, w in enumerate(windows):
+        if not w:
+            raise ValueError(f"windows[{i}] must be a non-empty list of numbers")
+        arr = np.asarray(w, dtype=np.float32).reshape(-1)
+        if not np.isfinite(arr).all():
+            raise ValueError(f"windows[{i}] contains a non-finite value")
+        rows.append(arr)
+    t = int(rows[0].size)
+    if any(int(r.size) != t for r in rows):
+        raise ValueError("all windows must have the same context length T")
+    return rows
+
+
+def resolve_asof(
+    asof_timestamps: list[str] | None, n_windows: int
+) -> tuple[list[datetime] | None, timedelta | None]:
+    """Resolve per-window 'as-of' labels (the bar each window forecasts from).
+
+    Must be length n_windows, strictly increasing, and strictly regular so a
+    single step can label every window's forecast grid. Returns (parsed, step)
+    where step is None when n_windows == 1 (no spacing to infer).
+    """
+    if asof_timestamps is None:
+        return None, None
+    if len(asof_timestamps) != n_windows:
+        raise ValueError(
+            f"asof_timestamps length is {len(asof_timestamps)}, expected {n_windows}"
+        )
+    parsed = [parse_timestamp(v) for v in asof_timestamps]
+    if any(later <= earlier for earlier, later in zip(parsed, parsed[1:])):
+        raise ValueError("asof_timestamps must be strictly increasing")
+    if len(parsed) < 2:
+        return parsed, None
+    deltas = [later - earlier for earlier, later in zip(parsed, parsed[1:])]
+    if any(delta != deltas[0] for delta in deltas[1:]):
+        raise ValueError("asof_timestamps are not strictly regular")
+    return parsed, deltas[0]
+
+
+def _asof_format(
+    raw: list[str], parsed: list[datetime], step: timedelta | None, horizon: int
+) -> list[dict[str, Any]]:
+    # date_only is decided from the RAW strings: a datetime parsed from
+    # "2026-09-01" stringifies to "2026-09-01 00:00:00" and would never be
+    # date-only-detected, so date-only inputs must echo as dates, not T00:00:00.
+    date_only = all(_is_date_only(v) for v in raw)
+    out: list[dict[str, Any]] = []
+    for i, ts in enumerate(parsed):
+        item: dict[str, Any] = {"asof": _format_timestamp(ts, date_only)}
+        if step is not None:
+            item["timestamps"] = [
+                _format_timestamp(ts + step * (j + 1), date_only) for j in range(horizon)
+            ]
+        out.append(item)
+    return out
+
+
+def _predict_batch(forecaster: Any, contexts: list[np.ndarray], horizon: int) -> list[Any]:
+    return list(
+        forecaster.predict_batch(
+            contexts,
+            horizon=int(horizon),
+            return_quantiles=True,
+            use_symmetric_averaging=False,
+        )
+    )
+
+
+def run_forecast_batch(
+    forecaster: Any,
+    *,
+    windows: list[list[float]],
+    horizon: int = 96,
+    window_ids: list[str] | None = None,
+    asof_timestamps: list[str] | None = None,
+) -> dict:
+    """Batch zero-shot forecast: N independent univariate contexts in ONE decode.
+
+    Equivalent to calling run_forecast(history=w, horizon=horizon) for each
+    window, but a single batched predict_batch call. All windows must share the
+    same context length T. Very large batches can be chunked by the caller.
+
+    asof_timestamps (length N, strictly regular) labels each window with the
+    bar it forecasts from plus the full forecast-step grid, so consumers never
+    pin results by position alone.
+    """
+    try:
+        if int(horizon) < 1:
+            raise ValueError("horizon must be >= 1")
+        contexts = resolve_windows(windows)
+        n = len(contexts)
+        if window_ids is not None and len(window_ids) != n:
+            raise ValueError(
+                f"window_ids length is {len(window_ids)}, expected {n}"
+            )
+        parsed, step = resolve_asof(asof_timestamps, n)
+    except (TypeError, ValueError) as exc:
+        return {"status": "error", "error": str(exc)}
+
+    try:
+        outputs = _predict_batch(forecaster, contexts, horizon)
+    except Exception as exc:  # GPU-side failure fails the whole batch
+        return {"status": "error", "error": f"batch decode failed: {exc}"}
+    if len(outputs) != n:
+        return {
+            "status": "error",
+            "error": f"model returned {len(outputs)} outputs, expected {n}",
+        }
+
+    stamped = (
+        _asof_format(asof_timestamps, parsed, step, int(horizon))
+        if parsed is not None
+        else None
+    )
+    items: list[dict[str, Any]] = []
+    for i, out in enumerate(outputs):
+        forecast = np.asarray(out.forecast)
+        if forecast.ndim != 1:
+            return {
+                "status": "error",
+                "error": f"window {i}: unexpected forecast shape {forecast.shape}",
+            }
+        quantiles = None if getattr(out, "quantiles", None) is None else np.asarray(out.quantiles)
+        if quantiles is not None:
+            if quantiles.ndim == 1:
+                quantiles = quantiles.reshape(-1, 1)
+            if quantiles.ndim != 2:
+                return {
+                    "status": "error",
+                    "error": f"window {i}: unexpected quantiles shape {quantiles.shape}",
+                }
+        item: dict[str, Any] = {
+            "id": window_ids[i] if window_ids is not None else f"window_{i}",
+            "forecast": forecast.astype(float).tolist(),
+            "quantiles": serialize_quantiles(quantiles),
+        }
+        if stamped is not None:
+            item.update(stamped[i])
+        items.append(item)
+
+    return {
+        "status": "success",
+        "model": CHECKPOINT,
+        "mode": "batch",
+        "n_windows": n,
+        "context_length": int(contexts[0].size),
+        "horizon": int(horizon),
+        "windows": items,
+        "quantile_levels": QUANTILE_LEVELS,
+        "license": LICENSE_NOTE,
+    }
+
+
+def run_widths(
+    forecaster: Any,
+    *,
+    windows: list[list[float]],
+    horizon: int = 96,
+    lower: float = 0.10,
+    upper: float = 0.90,
+    with_median: bool = True,
+    asof_timestamps: list[str] | None = None,
+) -> dict:
+    """Batch quantile-width forecast: per-window upper-lower quantile range at
+    the final forward step, plus the median. A compact payload for volatility-
+    band consumers that would otherwise ship (and reduce) nine full quantile
+    curves per window. The range is base-invariant (a shared offset cancels).
+    """
+    try:
+        if int(horizon) < 1:
+            raise ValueError("horizon must be >= 1")
+        contexts = resolve_windows(windows)
+        n = len(contexts)
+        li = _quantile_index(lower)
+        ui = _quantile_index(upper)
+        if li >= ui:
+            raise ValueError("lower must be strictly less than upper")
+        mi = _quantile_index(0.5)  # 0.5 is a fixed level, always present
+        parsed, step = resolve_asof(asof_timestamps, n)
+    except (TypeError, ValueError) as exc:
+        return {"status": "error", "error": str(exc)}
+
+    try:
+        outputs = _predict_batch(forecaster, contexts, horizon)
+    except Exception as exc:
+        return {"status": "error", "error": f"batch decode failed: {exc}"}
+    if len(outputs) != n:
+        return {
+            "status": "error",
+            "error": f"model returned {len(outputs)} outputs, expected {n}",
+        }
+
+    stamped = (
+        _asof_format(asof_timestamps, parsed, step, int(horizon))
+        if parsed is not None
+        else None
+    )
+    items: list[dict[str, Any]] = []
+    for i, out in enumerate(outputs):
+        q = getattr(out, "quantiles", None)
+        if q is None:
+            return {"status": "error", "error": f"window {i}: model returned no quantiles"}
+        q = np.asarray(q)
+        if q.ndim == 1:
+            q = q.reshape(-1, 1)
+        if q.ndim != 2 or int(q.shape[0]) != int(horizon):
+            return {
+                "status": "error",
+                "error": f"window {i}: unexpected quantiles shape {q.shape}",
+            }
+        row = q[int(horizon) - 1]
+        item: dict[str, Any] = {"id": f"window_{i}"}
+        if stamped is not None:
+            item.update(stamped[i])
+        item["width"] = float(row[ui] - row[li])
+        if with_median:
+            item["median"] = float(row[mi])
+        items.append(item)
+
+    payload: dict[str, Any] = {
+        "status": "success",
+        "model": CHECKPOINT,
+        "mode": "widths",
+        "n_windows": n,
+        "context_length": int(contexts[0].size),
+        "horizon": int(horizon),
+        "lower": float(lower),
+        "upper": float(upper),
+        "windows": items,
+        "widths": [it["width"] for it in items],
+        "quantile_levels": QUANTILE_LEVELS,
+        "license": LICENSE_NOTE,
+    }
+    if with_median:
+        payload["medians"] = [it["median"] for it in items]
+    return payload
+
+
 def run_forecast(
     forecaster: Any,
     *,

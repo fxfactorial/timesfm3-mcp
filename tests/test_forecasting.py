@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from forecasting import run_forecast, serialize_quantiles
+from forecasting import run_forecast, run_forecast_batch, run_widths, serialize_quantiles
 
 
 class FakeForecaster:
@@ -29,6 +29,30 @@ class FakeForecaster:
             }
         )
         yield SimpleNamespace(forecast=self._forecast, quantiles=self._quantiles)
+
+
+class BatchFakeForecaster:
+    """Per-context outputs: window i forecasts a CONSTANT 100+10*i at every
+    step (no per-step ramp, so the final step still reads 100+10*i) and the
+    quantile row is [f-2, f-1.5, ..., f+2] so width(0.1,0.9)=4 and median=f."""
+
+    def __init__(self, n_outputs=None, drop_last=False):
+        self._n = n_outputs
+        self._drop_last = drop_last
+        self.calls: list[dict] = []
+
+    def predict_batch(self, contexts, horizon, **kwargs):
+        self.calls.append({"n_contexts": len(contexts), "horizon": horizon, **kwargs})
+        for i, ctx in enumerate(contexts):
+            if self._drop_last and i == len(contexts) - 1:
+                continue
+            f = np.full(horizon, float(100 + 10 * i), dtype=np.float32)
+            q = np.stack([f - 2 + 0.5 * k for k in range(9)], axis=1)
+            yield SimpleNamespace(forecast=f, quantiles=q)
+
+
+def _windows(n: int, t: int):
+    return [[10.0 + 0.1 * i + 0.01 * j for j in range(t)] for i in range(n)]
 
 
 def _univariate_out(horizon: int = 5, n_q: int = 9):
@@ -390,6 +414,178 @@ class CalendarTests(unittest.TestCase):
         self.assertEqual(
             out["series"][1]["timestamps"],
             out["series"][0]["timestamps"],
+        )
+
+
+class BatchForecastTests(unittest.TestCase):
+    def test_single_batched_call_and_per_window_payload(self):
+        fake = BatchFakeForecaster()
+        out = run_forecast_batch(fake, windows=_windows(3, 512), horizon=4)
+        self.assertEqual(out["status"], "success")
+        self.assertEqual(out["mode"], "batch")
+        self.assertEqual(out["n_windows"], 3)
+        self.assertEqual(out["context_length"], 512)
+        self.assertEqual(out["horizon"], 4)
+        self.assertEqual(len(out["windows"]), 3)
+        # one model pass for the whole batch
+        self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(fake.calls[0]["n_contexts"], 3)
+        self.assertTrue(fake.calls[0]["return_quantiles"])
+        self.assertFalse(fake.calls[0]["use_symmetric_averaging"])
+        # per-window values are positionally distinct and complete
+        for i, w in enumerate(out["windows"]):
+            self.assertEqual(w["id"], f"window_{i}")
+            self.assertEqual(len(w["forecast"]), 4)
+            self.assertEqual(w["quantiles"]["q90"][0], w["forecast"][0] + 2.0)
+            self.assertAlmostEqual(w["forecast"][0], 100 + 10 * i, places=5)
+
+    def test_window_ids(self):
+        fake = BatchFakeForecaster()
+        out = run_forecast_batch(
+            fake, windows=_windows(2, 8), horizon=2, window_ids=["eth", "btc"]
+        )
+        self.assertEqual(out["windows"][0]["id"], "eth")
+        self.assertEqual(out["windows"][1]["id"], "btc")
+
+    def test_window_ids_length_mismatch(self):
+        fake = BatchFakeForecaster()
+        out = run_forecast_batch(fake, windows=_windows(2, 8), horizon=2, window_ids=["a"])
+        self.assertEqual(out["status"], "error")
+        self.assertIn("window_ids", out["error"])
+        self.assertEqual(fake.calls, [])
+
+    def test_horizon_must_be_positive(self):
+        fake = BatchFakeForecaster()
+        out = run_forecast_batch(fake, windows=_windows(2, 8), horizon=0)
+        self.assertEqual(out["status"], "error")
+        self.assertIn("horizon", out["error"])
+        self.assertEqual(fake.calls, [])
+
+    def test_empty_windows(self):
+        fake = BatchFakeForecaster()
+        out = run_forecast_batch(fake, windows=[], horizon=2)
+        self.assertEqual(out["status"], "error")
+
+    def test_uneven_window_lengths(self):
+        fake = BatchFakeForecaster()
+        out = run_forecast_batch(fake, windows=[_windows(1, 8)[0], _windows(1, 7)[0]], horizon=2)
+        self.assertEqual(out["status"], "error")
+        self.assertIn("same context length", out["error"])
+        self.assertEqual(fake.calls, [])
+
+    def test_non_finite_window_value(self):
+        fake = BatchFakeForecaster()
+        windows = _windows(1, 4)
+        windows[0][2] = float("nan")
+        out = run_forecast_batch(fake, windows=windows, horizon=2)
+        self.assertEqual(out["status"], "error")
+        self.assertIn("non-finite", out["error"])
+        self.assertEqual(fake.calls, [])
+
+    def test_model_output_count_mismatch(self):
+        fake = BatchFakeForecaster(drop_last=True)
+        out = run_forecast_batch(fake, windows=_windows(3, 8), horizon=2)
+        self.assertEqual(out["status"], "error")
+        self.assertIn("expected 3", out["error"])
+
+    def test_asof_timestamps_label_each_window_grid(self):
+        fake = BatchFakeForecaster()
+        out = run_forecast_batch(
+            fake,
+            windows=_windows(3, 8),
+            horizon=2,
+            asof_timestamps=["2026-09-01", "2026-09-02", "2026-09-03"],
+        )
+        self.assertEqual(out["status"], "success")
+        for i, w in enumerate(out["windows"]):
+            self.assertEqual(w["asof"], f"2026-09-0{i + 1}")
+        self.assertEqual(
+            out["windows"][0]["timestamps"], ["2026-09-02", "2026-09-03"]
+        )
+        self.assertEqual(
+            out["windows"][2]["timestamps"], ["2026-09-04", "2026-09-05"]
+        )
+
+    def test_asof_wrong_length(self):
+        fake = BatchFakeForecaster()
+        out = run_forecast_batch(
+            fake, windows=_windows(3, 8), horizon=2, asof_timestamps=["2026-09-01"]
+        )
+        self.assertEqual(out["status"], "error")
+        self.assertIn("expected 3", out["error"])
+        self.assertEqual(fake.calls, [])
+
+    def test_asof_irregular_rejected(self):
+        fake = BatchFakeForecaster()
+        out = run_forecast_batch(
+            fake,
+            windows=_windows(3, 8),
+            horizon=2,
+            asof_timestamps=["2026-09-01", "2026-09-02", "2026-09-04"],
+        )
+        self.assertEqual(out["status"], "error")
+        self.assertIn("not strictly regular", out["error"])
+        self.assertEqual(fake.calls, [])
+
+
+class WidthsTests(unittest.TestCase):
+    def test_width_is_final_step_quantile_range(self):
+        fake = BatchFakeForecaster()
+        # quantile row = [f-2 .. f+2] -> q90-q10 = 4, median = f
+        out = run_widths(fake, windows=_windows(3, 512), horizon=4)
+        self.assertEqual(out["status"], "success")
+        self.assertEqual(out["mode"], "widths")
+        self.assertEqual(out["lower"], 0.1)
+        self.assertEqual(out["upper"], 0.9)
+        self.assertEqual(len(fake.calls), 1)
+        for i in range(3):
+            self.assertAlmostEqual(out["windows"][i]["width"], 4.0, places=5)
+            self.assertAlmostEqual(out["windows"][i]["median"], 100 + 10 * i, places=5)
+        self.assertEqual(out["widths"], [w["width"] for w in out["windows"]])
+        self.assertEqual(out["medians"], [w["median"] for w in out["windows"]])
+
+    def test_with_median_false(self):
+        fake = BatchFakeForecaster()
+        out = run_widths(fake, windows=_windows(1, 8), horizon=2, with_median=False)
+        self.assertEqual(out["status"], "success")
+        self.assertNotIn("medians", out)
+        self.assertNotIn("median", out["windows"][0])
+
+    def test_custom_levels(self):
+        fake = BatchFakeForecaster()
+        out = run_widths(fake, windows=_windows(1, 8), horizon=2, lower=0.2, upper=0.8)
+        self.assertEqual(out["status"], "success")
+        # q20-q80 = (f-1.5) - (f+1.5) -> range 3.0
+        self.assertAlmostEqual(out["windows"][0]["width"], 3.0, places=5)
+
+    def test_lower_must_be_below_upper(self):
+        fake = BatchFakeForecaster()
+        out = run_widths(fake, windows=_windows(1, 8), horizon=2, lower=0.9, upper=0.1)
+        self.assertEqual(out["status"], "error")
+        self.assertIn("less than", out["error"])
+        self.assertEqual(fake.calls, [])
+
+    def test_level_must_be_a_quantile_level(self):
+        fake = BatchFakeForecaster()
+        out = run_widths(fake, windows=_windows(1, 8), horizon=2, lower=0.15, upper=0.85)
+        self.assertEqual(out["status"], "error")
+        self.assertIn("quantile levels", out["error"])
+        self.assertEqual(fake.calls, [])
+
+    def test_asof_labels(self):
+        fake = BatchFakeForecaster()
+        out = run_widths(
+            fake,
+            windows=_windows(2, 8),
+            horizon=2,
+            asof_timestamps=["2026-09-01T00:00:00", "2026-09-01T15:00:00"],
+        )
+        self.assertEqual(out["status"], "success")
+        self.assertEqual(out["windows"][0]["asof"], "2026-09-01T00:00:00")
+        # step = 15h (from the asof pair); forecast grid continues from each asof
+        self.assertEqual(
+            out["windows"][1]["timestamps"],
+            ["2026-09-02T06:00:00", "2026-09-02T21:00:00"],
         )
 
 

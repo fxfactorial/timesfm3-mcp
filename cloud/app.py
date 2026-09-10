@@ -12,7 +12,7 @@ for path in (Path(__file__).resolve().parent, ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from forecasting import run_forecast  # noqa: E402
+from forecasting import run_forecast, run_forecast_batch, run_widths  # noqa: E402
 
 hf_token = os.environ.get("HF_TOKEN")
 if hf_token:
@@ -90,6 +90,78 @@ def forecast_demand(history: list[float], horizon: int = 5) -> dict:
     Same TimesFM-3 non-commercial license limit.
     """
     return run_forecast(forecaster, history=history, horizon=horizon)
+
+
+@mcp.tool()
+def forecast_batch(
+    windows: list[list[float]],
+    horizon: int = 96,
+    window_ids: list[str] | None = None,
+    asof_timestamps: list[str] | None = None,
+) -> dict:
+    """Batch zero-shot forecast: N independent univariate contexts in ONE decode.
+
+    Equivalent to calling `forecast` per window, but a single batched model
+    pass — much faster for backfills and studies. All windows must have the
+    same context length T.
+
+    Optional asof_timestamps (length N, strictly regular ISO dates) labels each
+    window with the bar it forecasts from plus the full forecast-step grid, so
+    results are never pinned by position alone.
+
+    TimesFM-3 weights are licensed for non-commercial, non-production use only.
+
+    Args:
+        windows: N univariate contexts, each a chronological list of length T.
+        horizon: Number of future steps per window. Must be >= 1.
+        window_ids: Optional names, one per window.
+        asof_timestamps: Optional ISO timestamps, one per window, strictly regular.
+    """
+    return run_forecast_batch(
+        forecaster,
+        windows=windows,
+        horizon=horizon,
+        window_ids=window_ids,
+        asof_timestamps=asof_timestamps,
+    )
+
+
+@mcp.tool()
+def widths(
+    windows: list[list[float]],
+    horizon: int = 96,
+    lower: float = 0.10,
+    upper: float = 0.90,
+    with_median: bool = True,
+    asof_timestamps: list[str] | None = None,
+) -> dict:
+    """Batch quantile widths: per-window (upper - lower) quantile range at the
+    final forward step, plus the median. A compact payload for volatility-band
+    consumers that would otherwise ship and reduce nine full quantile curves
+    per window. The range is base-invariant (a shared level offset cancels).
+
+    lower / upper must be quantile levels the model returns (0.10-0.90).
+    Optional asof_timestamps (length N, strictly regular) labels each window.
+
+    TimesFM-3 weights are licensed for non-commercial, non-production use only.
+
+    Args:
+        windows: N univariate contexts, each a chronological list of length T.
+        horizon: Number of future steps per window. Must be >= 1.
+        lower: Lower quantile level for the width (default 0.10).
+        upper: Upper quantile level for the width (default 0.90).
+        with_median: Also return the q50 at the final step (default true).
+        asof_timestamps: Optional ISO timestamps, one per window, strictly regular.
+    """
+    return run_widths(
+        forecaster,
+        windows=windows,
+        horizon=horizon,
+        lower=lower,
+        upper=upper,
+        with_median=with_median,
+        asof_timestamps=asof_timestamps,
+    )
 
 
 if __name__ == "__main__":
